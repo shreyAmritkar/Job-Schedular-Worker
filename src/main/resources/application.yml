@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: distributed-job-scheduler
+
+  # Flyway owns schema creation/evolution. Hibernate must never auto-generate DDL.
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+logging:
+  level:
+    root: INFO
