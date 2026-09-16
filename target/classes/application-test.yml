@@ -1,0 +1,17 @@
+# Datasource and Redis coordinates are NOT hardcoded here.
+# AbstractIntegrationTest injects them at runtime via @DynamicPropertySource,
+# because Testcontainers assigns random host ports per run.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+scheduler:
+  leader-election:
+    lease-ttl: 3s
+    renewal-interval: 1s
+    retry-interval: 1s
+    retry-jitter: 500ms
+
+server:
+  port: 0
