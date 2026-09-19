@@ -12,6 +12,18 @@ scheduler:
     renewal-interval: 1s
     retry-interval: 1s
     retry-jitter: 500ms
+  queue:
+    # backpressure-threshold intentionally NOT overridden here — it stays at
+    # the application.yml default (10,000) so bulk-load concurrency tests
+    # (100/1000+1 jobs) don't spuriously hit backpressure. The dedicated
+    # backpressure test overrides this threshold locally via
+    # @TestPropertySource instead of shrinking it globally.
+    aging-interval: 200ms
+    aging-threshold: 300ms
+    aging-boost: 1000000000
+  worker-pool:
+    size: 4
+    poll-backoff: 100ms
 
 server:
   port: 0

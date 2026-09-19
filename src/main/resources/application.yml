@@ -20,7 +20,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health, metrics
   endpoint:
     health:
       show-details: never
@@ -31,6 +31,14 @@ scheduler:
     renewal-interval: 10s
     retry-interval: 5s
     retry-jitter: 2s
+  queue:
+    backpressure-threshold: 10000
+    aging-interval: 60s
+    aging-threshold: 5m
+    aging-boost: 1000000000
+  worker-pool:
+    size: 4
+    poll-backoff: 500ms
 
 logging:
   level:

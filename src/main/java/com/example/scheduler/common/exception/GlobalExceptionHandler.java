@@ -3,6 +3,7 @@ package com.example.scheduler.common.exception;
 import com.example.scheduler.job.exception.InvalidJobScheduleException;
 import com.example.scheduler.job.exception.JobConflictException;
 import com.example.scheduler.job.exception.JobNotFoundException;
+import com.example.scheduler.queue.exception.QueueBackpressureException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -33,6 +34,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> handleConflict(JobConflictException ex, HttpServletRequest request) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(ApiError.of(HttpStatus.CONFLICT.value(), "Conflict", ex.getMessage(), request.getRequestURI()));
+    }
+
+    @ExceptionHandler(QueueBackpressureException.class)
+    public ResponseEntity<ApiError> handleBackpressure(QueueBackpressureException ex, HttpServletRequest request) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .body(ApiError.of(HttpStatus.TOO_MANY_REQUESTS.value(), "Too Many Requests",
+                        ex.getMessage(), request.getRequestURI()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

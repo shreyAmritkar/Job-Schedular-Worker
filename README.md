@@ -1,758 +1,235 @@
-# Distributed Job Scheduler — Stage 2
+# Distributed Job Scheduler
 
-## Redis Leader Election
+Stages 0–3 complete: project skeleton, job CRUD, Redis-based leader
+election, and a Redis-backed priority job queue with a worker pool. No
+cron scheduling, visibility timeout, per-job distributed locking, or
+retries yet — that starts in later stages.
 
-Stage 2 introduces **Redis-based leader election** for the distributed job scheduler.
+## Stack
 
-Multiple Spring Boot scheduler instances can run simultaneously, but only one instance should act as the **scheduler leader** at a time.
+- Java 21, Spring Boot 3.3
+- Maven
+- PostgreSQL 16
+- Redis 7 (via Lettuce, through `spring-boot-starter-data-redis`) — connected
+  since Stage 0, not yet used for queueing
+- Flyway
+- JUnit 5, Testcontainers, Mockito
+- Docker Compose
 
-> **Stage 2 does not implement the job queue, workers, job execution, or retries.**
+## Project layout
 
----
-
-## 1. Objective
-
-The objective of Stage 2 is to ensure that when multiple scheduler instances are running:
-
-```text
-Instance A ─┐
-Instance B ─┼──> Redis ──> One Leader
-Instance C ─┘
+```
+distributed-job-scheduler/
+├── pom.xml
+├── Dockerfile
+├── docker-compose.yml
+├── src/main/java/com/example/scheduler/
+│   ├── SchedulerApplication.java
+│   ├── job/                              # Stage 1: job CRUD
+│   │   ├── Job.java                      # entity
+│   │   ├── JobStatus.java                # ACTIVE, PAUSED, DISABLED, CANCELLED
+│   │   ├── ScheduleType.java             # CRON, ONE_TIME
+│   │   ├── JobRepository.java            # atomic cancel/trigger queries
+│   │   ├── JobService.java               # business logic, transactions
+│   │   ├── JobValidator.java             # scheduling domain rules
+│   │   ├── JobMapper.java
+│   │   ├── JobController.java
+│   │   ├── dto/
+│   │   │   ├── CreateJobRequest.java
+│   │   │   └── JobResponse.java
+│   │   └── exception/
+│   │       ├── JobNotFoundException.java
+│   │       ├── InvalidJobScheduleException.java
+│   │       └── JobConflictException.java
+│   ├── leader/                           # Stage 2: Redis leader election
+│   │   ├── InstanceIdProvider.java       # one stable id per JVM
+│   │   ├── LeaderElectionProperties.java # lease TTL, renewal/retry intervals, jitter
+│   │   ├── LeaderState.java              # thread-safe current-state holder
+│   │   ├── RedisLeaderRepository.java    # SET NX EX + Lua compare-and-swap
+│   │   ├── LeaderElectionService.java    # acquire/renew/step-down state machine
+│   │   ├── SchedulerStatusController.java
+│   │   └── dto/SchedulerStatusResponse.java
+│   ├── queue/                            # Stage 3: Redis priority queue + workers
+│   │   ├── JobQueueService.java          # ZADD/ZPOPMIN, backpressure, Lua aging
+│   │   ├── JobQueueProperties.java       # backpressure threshold, aging timing
+│   │   ├── QueuedJob.java                # jobId + score, returned by poll()
+│   │   ├── WorkerPool.java               # configurable worker threads
+│   │   ├── WorkerPoolProperties.java     # pool size, poll backoff
+│   │   ├── JobExecutor.java              # execution interface
+│   │   ├── LoggingJobExecutor.java       # Stage 3's placeholder implementation
+│   │   └── exception/QueueBackpressureException.java
+│   └── common/
+│       ├── PageResponse.java             # stable pagination shape
+│       ├── redis/RedisClientConfig.java  # raw Lettuce beans (not RedisTemplate)
+│       └── exception/
+│           ├── ApiError.java
+│           └── GlobalExceptionHandler.java
+├── src/main/resources/
+│   ├── application.yml                   # shared config (JPA, Flyway, actuator)
+│   ├── application-local.yml             # run from IDE, localhost DB/Redis
+│   ├── application-docker.yml            # run inside docker compose
+│   ├── application-test.yml              # Testcontainers overrides coordinates at runtime
+│   └── db/migration/
+│       ├── V1__init_schema.sql           # jobs, job_executions tables
+│       └── V2__job_schedule_type.sql     # cron/one-time scheduling, CANCELLED status
+└── src/test/java/com/example/scheduler/
+    ├── AbstractIntegrationTest.java      # shared Postgres+Redis Testcontainers base
+    ├── SchedulerApplicationIT.java       # context load + health check
+    └── job/
+        ├── JobValidatorTest.java         # Mockito/plain unit tests
+        ├── JobServiceTest.java           # Mockito unit tests
+        ├── JobRepositoryIT.java          # Testcontainers Postgres integration
+        └── JobControllerIT.java          # full HTTP stack integration
 ```
 
-Only one instance acquires the scheduler leadership lease.
+## Running with Docker Compose
 
-If the current leader fails or loses its lease, another instance can acquire leadership.
-
----
-
-## 2. Technology Used
-
-* Java 21
-* Spring Boot 3.3
-* Maven
-* Redis 7
-* Lettuce Redis Client
-* JUnit 5
-* Mockito
-* Testcontainers
-* Docker / Docker Compose
-
-Redis is used only for **leader election** in this stage.
-
----
-
-# 3. Redis Leader Key
-
-The leader is stored using:
-
-```text
-scheduler:leader
+```bash
+docker compose up --build
 ```
 
-The value of the key is the unique `instanceId` of the current leader.
+This starts Postgres 16, Redis 7, and the app (`docker` profile). The app
+waits for both dependencies to report healthy before starting.
 
-Example:
+Verify:
 
-```text
-Key:
-scheduler:leader
-
-Value:
-scheduler-01-a83f12bc
+```bash
+curl localhost:8080/actuator/health
+# {"status":"UP"}
 ```
 
-The key has a **30-second TTL**.
+## Running locally (IDE / CLI)
 
----
+Start Postgres and Redis yourself (e.g. `docker compose up postgres redis`),
+matching the credentials in `application-local.yml`
+(`job_scheduler` / `scheduler` / `scheduler` on `localhost:5432` and
+`localhost:6379`), then run the app with the `local` profile:
 
-# 4. Leader Acquisition
-
-A scheduler attempts to acquire leadership using:
-
-```redis
-SET scheduler:leader {instanceId} NX EX 30
+```bash
+mvn spring-boot:run -Dspring-boot.run.profiles=local
 ```
 
-### Meaning
-
-`NX`:
-
-```text
-Only create the key if it does not already exist.
-```
-
-`EX 30`:
-
-```text
-Set the key's expiration time to 30 seconds.
-```
-
-Because Redis executes this command atomically, two instances cannot both successfully acquire the same existing lease.
-
-### Example
-
-Suppose instances A and B start at approximately the same time.
-
-```text
-Instance A:
-SET scheduler:leader A NX EX 30
-        ↓
-       OK
-        ↓
-     LEADER
-```
-
-```text
-Instance B:
-SET scheduler:leader B NX EX 30
-        ↓
-      NIL
-        ↓
-    STANDBY
-```
-
-Only A successfully acquires the lease.
-
----
-
-# 5. Instance ID
-
-Every application instance generates a unique `instanceId`.
-
-Example:
-
-```text
-scheduler-host-a83f12bc
-```
-
-The ID is generated once when the application starts and remains constant for that JVM lifetime.
-
-The instance ID is stored in:
-
-```text
-InstanceIdProvider.java
-```
-
-It is used as the Redis value:
-
-```text
-scheduler:leader → instanceId
-```
-
-This allows an instance to verify whether it still owns the leader lease.
-
----
-
-# 6. Leader Election Lifecycle
-
-The leader election state machine is:
-
-```text
-                 Application Start
-                        |
-                        v
-                 Try to acquire
-                   /         \
-              Success        Failure
-                |               |
-                v               v
-             LEADER          STANDBY
-                |               |
-                |               |
-          Renew every 10s   Retry periodically
-                |               |
-             Success         Acquisition
-                |               |
-                v               v
-             LEADER          LEADER
-                |
-             Failure
-                |
-                v
-          Step down
-                |
-                v
-             STANDBY
-```
-
----
-
-# 7. Leader Renewal
-
-The leader renews its lease every **10 seconds**.
-
-The lease itself is 30 seconds.
-
-Therefore:
-
-```text
-Lease TTL       = 30 seconds
-Renewal period  = 10 seconds
-```
-
-Renewal does **not** blindly call:
-
-```redis
-EXPIRE scheduler:leader 30
-```
-
-Instead, the current Redis value is first compared with the instance's own ID.
-
-Conceptually:
-
-```text
-IF scheduler:leader == my instanceId
-    renew TTL
-ELSE
-    renewal fails
-```
-
-This operation is implemented using a Redis Lua script.
-
----
-
-# 8. Why Ownership Verification Is Required
-
-Consider this situation:
-
-```text
-Instance A is leader
-        |
-        v
-A stops/pause for > 30 seconds
-        |
-        v
-Redis lease expires
-        |
-        v
-Instance B becomes leader
-```
-
-Redis now contains:
-
-```text
-scheduler:leader → B
-```
-
-If A wakes up and blindly executes:
-
-```redis
-EXPIRE scheduler:leader 30
-```
-
-A could accidentally renew B's lease.
-
-Therefore renewal must verify:
-
-```text
-Redis value == my instanceId
-```
-
-If the comparison fails, A immediately steps down.
-
----
-
-# 9. Step Down on Lease Loss
-
-If the leader cannot successfully renew its lease, it immediately stops considering itself the leader.
-
-The state changes:
-
-```text
-LEADER
-   |
-   | renewal failure
-   v
-STANDBY
-```
-
-The transition is logged as:
-
-```text
-LOST leadership
-STEPPED DOWN
-```
-
-This provides fail-closed behavior when ownership can no longer be verified.
-
----
-
-# 10. Standby Retry and Jitter
-
-Instances that are not leaders periodically attempt to acquire leadership.
-
-A fixed retry interval is used with random jitter.
-
-Example:
-
-```text
-Retry interval = 5 seconds
-Jitter         = 0–2 seconds
-```
-
-Therefore different instances may retry at:
-
-```text
-Instance A → 5.1 seconds
-Instance B → 6.3 seconds
-Instance C → 5.7 seconds
-Instance D → 6.8 seconds
-```
-
-Instead of:
-
-```text
-A → 5 sec
-B → 5 sec
-C → 5 sec
-D → 5 sec
-```
-
-Random jitter reduces the **thundering herd problem**, where many standby instances simultaneously contact Redis after a lease becomes available.
-
----
-
-# 11. Compare-and-Delete
-
-When an instance releases leadership, it must not blindly execute:
-
-```redis
-DEL scheduler:leader
-```
-
-### Why?
-
-Suppose:
-
-```text
-A = old leader
-
-A pauses
-    ↓
-Lease expires
-    ↓
-B becomes leader
-    ↓
-scheduler:leader = B
-
-A wakes up
-    ↓
-DEL scheduler:leader
-```
-
-A would accidentally delete B's valid leadership lease.
-
-Therefore release uses a Lua compare-and-delete operation:
-
-```text
-IF scheduler:leader == my instanceId
-    DELETE scheduler:leader
-ELSE
-    DO NOTHING
-```
-
----
-
-# 12. Why Lua Is Used
-
-A normal Java implementation might do:
-
-```text
-GET scheduler:leader
-        |
-        v
-Compare value
-        |
-        v
-DEL / EXPIRE
-```
-
-This creates a race between the `GET` and the mutation.
-
-Another instance could acquire the lease between those operations.
-
-Lua allows the comparison and mutation to happen atomically inside Redis.
-
-The two important Lua operations are:
-
-```text
-Compare-and-Expire
-```
-
-and:
-
-```text
-Compare-and-Delete
-```
-
----
-
-# 13. Project Structure
-
-The Stage 2 code is mainly located under:
-
-```text
-src/main/java/com/example/scheduler/
-
-├── common/
-│   └── redis/
-│       └── RedisClientConfig.java
-│
-└── leader/
-    ├── InstanceIdProvider.java
-    ├── LeaderElectionProperties.java
-    ├── LeaderState.java
-    ├── RedisLeaderRepository.java
-    ├── LeaderElectionService.java
-    ├── SchedulerStatusController.java
-    │
-    └── dto/
-        └── SchedulerStatusResponse.java
-```
-
-### Important classes
-
-| Class                       | Responsibility                                  |
-| --------------------------- | ----------------------------------------------- |
-| `RedisClientConfig`         | Creates Redis/Lettuce connection                |
-| `InstanceIdProvider`        | Generates unique instance ID                    |
-| `LeaderElectionProperties`  | Stores lease/retry/renewal configuration        |
-| `RedisLeaderRepository`     | Performs Redis acquisition, renewal and release |
-| `LeaderState`               | Stores current local leader state               |
-| `LeaderElectionService`     | Controls the leader-election state machine      |
-| `SchedulerStatusController` | Exposes scheduler status API                    |
-| `SchedulerStatusResponse`   | Response DTO                                    |
-
----
-
-# 14. Redis Configuration
-
-Redis configuration is defined through Spring configuration.
-
-Example:
-
-```yaml
-spring:
-  data:
-    redis:
-      host: localhost
-      port: 6379
-
-scheduler:
-  leader-election:
-    lease-ttl: 30s
-    renewal-interval: 10s
-    retry-interval: 5s
-    retry-jitter: 2s
-```
-
----
-
-# 15. API
-
-Stage 2 exposes:
-
-```http
-GET /api/scheduler/status
-```
-
-Example response:
-
-```json
-{
-  "instanceId": "scheduler-01-a83f12bc",
-  "isLeader": true,
-  "lastRenewalAt": "2026-09-16T10:30:15Z"
-}
-```
-
-### Fields
-
-| Field           | Description                                             |
-| --------------- | ------------------------------------------------------- |
-| `instanceId`    | Unique ID of this application instance                  |
-| `isLeader`      | Whether this instance currently considers itself leader |
-| `lastRenewalAt` | Timestamp of the last successful lease renewal          |
-
----
-
-# 16. Leadership Logs
-
-Leadership transitions are logged.
-
-### Acquisition
-
-```text
-ACQUIRED leadership
-```
-
-### Lease loss
-
-```text
-LOST leadership
-```
-
-### Step down
-
-```text
-STEPPED DOWN
-```
-
-These logs make it possible to observe leadership changes across multiple scheduler instances.
-
----
-
-# 17. Testing
-
-Stage 2 includes tests for:
-
-### 1. Leader acquisition
-
-Verify that an instance can acquire an empty leader key.
-
-### 2. Failed acquisition
-
-Verify that an instance becomes standby when another instance owns the key.
-
-### 3. Two-instance election
-
-Run two logical scheduler instances and verify that only one acquires the lease.
-
-### 4. Renewal
-
-Verify that the leader's lease is renewed when it still owns the key.
-
-### 5. Lease loss
-
-Verify that the instance steps down when renewal fails or ownership is lost.
-
-### 6. Compare-and-delete
-
-Verify that:
-
-```text
-Owner A → can delete A's key
-Owner B → cannot delete A's key
-```
-
-### 7. Concurrent acquisition
-
-Multiple instances attempt acquisition concurrently.
-
-Redis must allow only one successful acquisition.
-
-### 8. Testcontainers
-
-Redis integration tests use Testcontainers so tests can run against a real Redis instance rather than a mocked Redis implementation.
-
-Run:
+## Running tests
 
 ```bash
 mvn clean verify
 ```
 
-A Docker daemon must be available for Testcontainers.
+Tests use Testcontainers to spin up disposable Postgres and Redis containers
+per JVM run — no docker-compose stack needs to be running first. Requires a
+working Docker daemon on the machine running the tests.
 
----
+## API (Stage 3)
 
-# 18. Failure Scenarios
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/jobs/{id}/enqueue` | Push an ACTIVE job into the Redis execution queue. `202` on success, `404` unknown job, `409` job not ACTIVE, `429` queue at backpressure threshold. |
 
-## Process crashes
+**Priority direction, clarified:** as of Stage 3, `priority` is a P1-style
+scale — **1 is the most urgent, 10 is the least urgent.** Stage 1 never
+pinned this down explicitly; it's fixed now because the queue's scoring
+formula requires a direction. See the Stage 3 design writeup (or ask) for
+why.
 
-If the leader process crashes:
+Redis structures:
+- `jobs:queue` — sorted set, score = `priority * 1_000_000_000 + enqueuedAtMillis`. Corrects the originally-specified formula, which used `-` instead of `+` on the timestamp and produced LIFO instead of the required FIFO within a priority tier.
+- `jobs:queue:enqueued-at` — companion hash (`jobId -> true original enqueue timestamp`), needed because aging repeatedly modifies scores in a way that can't be reliably decoded back into "how long has this waited," so the true timestamp is tracked separately.
 
-```text
-Leader
-  ↓
-Process stops
-  ↓
-No renewal
-  ↓
-30-second TTL expires
-  ↓
-Another instance can acquire leadership
+Backpressure: queue depth ≥ 10,000 rejects new submissions with `429` (soft
+limit — see design writeup for the check-then-act race this accepts).
+Aging: every 60s, jobs waiting over 5 minutes get their score reduced by
+one full priority level's worth, repeatedly, until they reach the front.
+
+Metrics (via Micrometer/Actuator, `/actuator/metrics/...`):
+`scheduler.queue.depth`, `scheduler.worker.active`.
+
+## API (Stage 2)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/scheduler/status` | `{ instanceId, isLeader, lastRenewalAt }` for this instance. |
+
+Redis key `scheduler:leader` holds the current leader's `instanceId` with a
+30s TTL. Acquisition is `SET scheduler:leader {instanceId} NX EX 30`.
+Renewal and release are Lua scripts that verify the caller still owns the
+key before extending/deleting it — never a blind `EXPIRE`/`DEL`. See the
+design writeup in-repo (or ask) for why that verification is required.
+
+## Correction from Stage 1
+
+`spring-boot-starter-validation` was missing from the POM. `@Valid` /
+`@NotBlank` etc. on `CreateJobRequest` compile fine without it but throw
+`NoProviderFoundException` at runtime the first time validation actually
+runs — meaning `POST /api/jobs` would likely have failed on every request.
+Added now; if you already had Stage 1 running, pull this dependency in.
+
+## API (Stage 1)
+
+All endpoints under `/api/jobs`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/jobs` | Create a job. `201` + `Location` header on success. |
+| `GET` | `/api/jobs?page=&size=` | Paginated list, `size` clamped to 100. |
+| `GET` | `/api/jobs/{id}` | Fetch one job, `404` if missing. |
+| `DELETE` | `/api/jobs/{id}` | Soft delete — sets `status = CANCELLED`. Idempotent (`204` even if already cancelled). |
+| `POST` | `/api/jobs/{id}/trigger` | Marks the job ready for later scheduling by setting `next_run_at = now()`. Does **not** execute anything. `409` if the job isn't `ACTIVE`. |
+
+**Create request body:**
+
+```json
+{
+  "name": "nightly-backup",
+  "cronExpression": "0 0 3 * * *",
+  "runAt": null,
+  "payload": { "any": "json" },
+  "priority": 8,
+  "maxRetries": 3
+}
 ```
 
-No explicit unlock is required for crash recovery.
+Exactly one of `cronExpression` / `runAt` must be set. `priority` is 1–10,
+`maxRetries` is ≥ 0. `cronExpression` is validated with Spring's
+`CronExpression.isValidExpression()` (six-field syntax, with seconds) — used
+purely as a syntax validator, not to schedule anything.
 
----
+## Schema
 
-## Process pauses longer than 30 seconds
+**`jobs`** (V1 + V2) — `id` (UUID), `name`, `schedule_type`
+(`CRON`/`ONE_TIME`), `cron_expression` (nullable), `run_at` (nullable,
+`TIMESTAMPTZ`), `payload` (JSONB), `priority` (1–10), `max_retries` (≥0),
+`retry_count`, `status` (`ACTIVE`/`PAUSED`/`DISABLED`/`CANCELLED`),
+`next_run_at`, `created_at`, `updated_at`. A `CHECK` constraint enforces
+that exactly one of `cron_expression`/`run_at` is set, matching
+`schedule_type` — enforced at the DB level, not just in application code.
 
-Suppose:
+**`job_executions`** — unchanged since Stage 0, still unused. No entity
+exists for it yet; it's schema-only until a later stage needs to write
+execution records.
 
-```text
-A = leader
-```
+## Troubleshooting
 
-A then pauses for more than 30 seconds.
+**`Remote host terminated the handshake` / `SSL peer shut down incorrectly`
+during `docker compose build`** — this is a Maven HTTP connection pooling
+issue against `repo.maven.apache.org`, not a project misconfiguration. The
+Dockerfile already sets `MAVEN_OPTS` to disable connection pooling as a fix.
+If it persists:
 
-Redis expires:
+1. `docker compose build --no-cache app` (rule out a bad cached layer)
+2. `docker run --rm curlimages/curl -sI https://repo.maven.apache.org/maven2/`
+   to check whether Docker's build network can reach Maven Central at all
+3. If you're on a VPN or corporate proxy with SSL inspection, that's the
+   likely root cause — try without it, or add your org's CA to the build
+   image's truststore
 
-```text
-scheduler:leader
-```
+## Explicitly out of scope so far
 
-Another instance B can acquire it.
-
-When A resumes, it must not continue acting as leader merely because its local state says it was previously leader.
-
-The renewal/ownership check causes A to step down when it cannot prove ownership.
-
----
-
-## Redis unavailable
-
-If the application cannot communicate with Redis, it cannot safely confirm leadership.
-
-The implementation therefore fails closed and steps down rather than continuing as an unverified leader.
-
----
-
-# 19. Limitations of Redis Leader Election
-
-This implementation provides a **Redis lease**, not a full consensus protocol.
-
-Important limitations include:
-
-* Redis availability directly affects leader election.
-* Network partitions can prevent an instance from confirming leadership.
-* A process can pause longer than the lease and resume with stale local state.
-* TTL provides lease expiration but is not a fencing mechanism.
-* Redis failover configuration can affect the guarantees of the system.
-* There are no fencing tokens or leader epochs in Stage 2.
-
-Therefore, later stages that perform important external side effects may require **fencing tokens / leader epochs** to prevent a stale process from performing work after losing leadership.
-
----
-
-# 20. Why TTL Alone Is Not Enough
-
-A TTL answers:
-
-```text
-"When should this Redis key expire?"
-```
-
-It does not answer:
-
-```text
-"Does this particular process still own the key?"
-```
-
-For example:
-
-```text
-A owns lease
-    ↓
-A pauses
-    ↓
-Lease expires
-    ↓
-B acquires lease
-    ↓
-A resumes
-```
-
-A TTL alone cannot prevent A from believing it is still leader.
-
-Therefore Stage 2 combines:
-
-```text
-Unique instance ID
-        +
-SET NX EX
-        +
-Ownership verification
-        +
-Lua compare-and-expire
-        +
-Lua compare-and-delete
-        +
-Immediate step-down
-```
-
----
-
-# 21. Stage 2 Scope
-
-### Included
-
-* Redis integration
-* Unique scheduler instance IDs
-* Leader acquisition
-* 30-second lease
-* Lease renewal every 10 seconds
-* Standby retry
-* Random retry jitter
-* Ownership verification
-* Lua compare-and-expire
-* Lua compare-and-delete
-* Leader state tracking
-* Leadership transition logging
-* Scheduler status endpoint
-* Redis integration tests
-
-### Not Included
-
-The following are intentionally **not implemented in Stage 2**:
-
-* Job queue
-* Redis queue
-* Worker processes
-* Job execution
-* Cron execution
-* Retry execution
-* Job claiming
-* Fencing tokens
-* Leader epoch numbers
-* Execution workers
-
-These belong to later stages.
-
----
-
-# 22. Summary
-
-Stage 2 establishes a Redis-backed leader election mechanism:
-
-```text
-Multiple Spring Boot Instances
-             |
-             v
-     Redis Leader Key
-   scheduler:leader
-             |
-       ┌─────┴─────┐
-       |           |
-    Leader       Standby
-       |           |
-    Renew       Retry
-       |           |
-       └─────┬─────┘
-             |
-      Leadership Changes
-```
-
-The key safety properties are:
-
-```text
-SET NX EX
-    ↓
-Atomic acquisition
-
-Lua compare-and-expire
-    ↓
-Only current owner can renew
-
-Lua compare-and-delete
-    ↓
-Only current owner can release
-
-Failed renewal
-    ↓
-Immediate step-down
-```
-
-This completes the Redis Leader Election stage without implementing Stage 3 job queue or worker functionality.
+- Any cron *execution* — cron expressions are validated, never evaluated/run
+- Job execution logic beyond LoggingJobExecutor's placeholder log line
+- Retries, visibility timeout, per-job distributed locking
+- Fencing tokens / leader epoch numbers
+- The leader automatically discovering due jobs from Postgres and calling
+  the enqueue endpoint — Stage 3 built the queue/worker infrastructure and
+  one manual enqueue entry point; wiring "leader walks next_run_at and
+  enqueues automatically" is a Stage 4 concern once cron evaluation exists
+- A `JobExecution` entity/repository — `job_executions` is schema-only

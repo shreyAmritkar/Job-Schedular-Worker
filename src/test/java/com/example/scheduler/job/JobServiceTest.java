@@ -5,6 +5,7 @@ import com.example.scheduler.job.dto.CreateJobRequest;
 import com.example.scheduler.job.dto.JobResponse;
 import com.example.scheduler.job.exception.JobConflictException;
 import com.example.scheduler.job.exception.JobNotFoundException;
+import com.example.scheduler.queue.JobQueueService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -38,6 +39,9 @@ class JobServiceTest {
 
     @Mock
     private JobValidator jobValidator;
+
+    @Mock
+    private JobQueueService jobQueueService;
 
     @InjectMocks
     private JobService jobService;
@@ -175,5 +179,56 @@ class JobServiceTest {
 
     private Pageable argThatPageIsZero() {
         return org.mockito.ArgumentMatchers.argThat(p -> p.getPageNumber() == 0);
+    }
+
+    @Test
+    void enqueueJob_delegatesToQueueServiceWhenJobIsActive() {
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(job));
+
+        jobService.enqueueJob(jobId);
+
+        verify(jobQueueService).enqueue(job.getId(), 5);
+    }
+
+    @Test
+    void enqueueJob_throwsNotFoundWhenJobDoesNotExist() {
+        when(jobRepository.findById(jobId)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> jobService.enqueueJob(jobId))
+                .isInstanceOf(JobNotFoundException.class);
+
+        verify(jobQueueService, never()).enqueue(any(), org.mockito.ArgumentMatchers.anyInt());
+    }
+
+    @Test
+    void enqueueJob_throwsConflictWhenJobIsCancelled() {
+        Job cancelledJob = cancelledJob();
+        when(jobRepository.findById(jobId)).thenReturn(Optional.of(cancelledJob));
+
+        assertThatThrownBy(() -> jobService.enqueueJob(jobId))
+                .isInstanceOf(JobConflictException.class);
+
+        verify(jobQueueService, never()).enqueue(any(), org.mockito.ArgumentMatchers.anyInt());
+    }
+
+    /**
+     * Job has no public setter for status (by design — see Job.java); the
+     * only production path to CANCELLED is the repository's atomic
+     * @Modifying update query, which doesn't mutate a Java object. For this
+     * unit test we just need *a* Job instance whose status is CANCELLED,
+     * so a small reflection helper is the honest option here rather than
+     * adding a test-only setter to production code.
+     */
+    private Job cancelledJob() {
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        try {
+            var statusField = Job.class.getDeclaredField("status");
+            statusField.setAccessible(true);
+            statusField.set(job, JobStatus.CANCELLED);
+            return job;
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

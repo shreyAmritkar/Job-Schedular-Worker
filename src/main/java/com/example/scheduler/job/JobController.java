@@ -55,4 +55,10 @@ public class JobController {
     public JobResponse triggerJob(@PathVariable UUID id) {
         return jobService.triggerJob(id);
     }
+
+    @PostMapping("/{id}/enqueue")
+    public ResponseEntity<JobResponse> enqueueJob(@PathVariable UUID id) {
+        JobResponse response = jobService.enqueueJob(id);
+        return ResponseEntity.accepted().body(response);
+    }
 }

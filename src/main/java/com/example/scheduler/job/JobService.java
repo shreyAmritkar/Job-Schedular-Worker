@@ -5,6 +5,7 @@ import com.example.scheduler.job.dto.CreateJobRequest;
 import com.example.scheduler.job.dto.JobResponse;
 import com.example.scheduler.job.exception.JobConflictException;
 import com.example.scheduler.job.exception.JobNotFoundException;
+import com.example.scheduler.queue.JobQueueService;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -22,10 +23,12 @@ public class JobService {
 
     private final JobRepository jobRepository;
     private final JobValidator jobValidator;
+    private final JobQueueService jobQueueService;
 
-    public JobService(JobRepository jobRepository, JobValidator jobValidator) {
+    public JobService(JobRepository jobRepository, JobValidator jobValidator, JobQueueService jobQueueService) {
         this.jobRepository = jobRepository;
         this.jobValidator = jobValidator;
+        this.jobQueueService = jobQueueService;
     }
 
     @Transactional
@@ -99,6 +102,33 @@ public class JobService {
 
         Job job = jobRepository.findById(id)
                 .orElseThrow(() -> new JobNotFoundException(id));
+        return JobMapper.toResponse(job);
+    }
+
+    /**
+     * Pushes an existing job into the Redis execution queue. Only ACTIVE
+     * jobs are eligible — same reasoning as triggerJob: a paused/disabled/
+     * cancelled job shouldn't enter the execution pipeline just because
+     * someone calls this endpoint. Backpressure (queue depth over
+     * threshold) is enforced inside JobQueueService and surfaces as
+     * QueueBackpressureException -> 429, not re-implemented here.
+     *
+     * Deliberately does NOT change the job's row in Postgres — Stage 3
+     * keeps "job definitions live in Postgres" and "the execution queue
+     * lives in Redis" as separate concerns; tracking that a job was queued
+     * is an execution-tracking feature for a later stage.
+     */
+    @Transactional(readOnly = true)
+    public JobResponse enqueueJob(UUID id) {
+        Job job = jobRepository.findById(id)
+                .orElseThrow(() -> new JobNotFoundException(id));
+
+        if (job.getStatus() != JobStatus.ACTIVE) {
+            throw new JobConflictException(
+                    "Cannot enqueue job in status " + job.getStatus() + "; only ACTIVE jobs can be enqueued");
+        }
+
+        jobQueueService.enqueue(job.getId(), job.getPriority());
         return JobMapper.toResponse(job);
     }
 }
