@@ -30,4 +30,21 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
     @Query("UPDATE Job j SET j.nextRunAt = :triggeredAt, j.updatedAt = CURRENT_TIMESTAMP "
             + "WHERE j.id = :id AND j.status = com.example.scheduler.job.JobStatus.ACTIVE")
     int triggerIfActive(@Param("id") UUID id, @Param("triggeredAt") OffsetDateTime triggeredAt);
+
+    /** Stage 4 retry bookkeeping: bumped once per recovery/retry attempt. */
+    @Modifying
+    @Query("UPDATE Job j SET j.retryCount = j.retryCount + 1, j.updatedAt = CURRENT_TIMESTAMP WHERE j.id = :id")
+    int incrementRetryCount(@Param("id") UUID id);
+
+    /** Stage 4: terminal state once retry budget is exhausted and the job is dead-lettered. */
+    @Modifying
+    @Query("UPDATE Job j SET j.status = com.example.scheduler.job.JobStatus.FAILED, j.updatedAt = CURRENT_TIMESTAMP "
+            + "WHERE j.id = :id")
+    int markFailed(@Param("id") UUID id);
+
+    /** Stage 4: the only sanctioned path back to ACTIVE from FAILED — a fresh retry budget via manual DLQ requeue. */
+    @Modifying
+    @Query("UPDATE Job j SET j.status = com.example.scheduler.job.JobStatus.ACTIVE, j.retryCount = 0, "
+            + "j.updatedAt = CURRENT_TIMESTAMP WHERE j.id = :id")
+    int resetForManualRequeue(@Param("id") UUID id);
 }

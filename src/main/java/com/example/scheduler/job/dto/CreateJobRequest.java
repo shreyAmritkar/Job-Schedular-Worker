@@ -9,6 +9,7 @@ import jakarta.validation.constraints.PositiveOrZero;
 import jakarta.validation.constraints.Size;
 
 import java.time.OffsetDateTime;
+import java.util.UUID;
 
 /**
  * Structural/transport validation only (blank checks, ranges, sizes) lives
@@ -37,6 +38,15 @@ public record CreateJobRequest(
 
         @NotNull(message = "maxRetries is required")
         @PositiveOrZero(message = "maxRetries must be zero or greater")
-        Integer maxRetries
+        Integer maxRetries,
+
+        /**
+         * Optional. If the caller wants to deduplicate this job's side
+         * effects against something outside this system (e.g. "only ever
+         * process this external event once even across job recreation"),
+         * they can supply their own key here. If omitted, one is generated
+         * server-side — every job always has an idempotency key.
+         */
+        UUID idempotencyKey
 ) {
 }

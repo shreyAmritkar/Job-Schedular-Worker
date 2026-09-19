@@ -70,6 +70,6 @@ class JobControllerEnqueueTest {
 
     private JobResponse sampleResponse(UUID id) {
         return new JobResponse(id, "job", ScheduleType.CRON, "0 0 * * * *", null, null,
-                5, 0, 0, JobStatus.ACTIVE, null, null, null);
+                5, 0, 0, JobStatus.ACTIVE, null, UUID.randomUUID(), null, null);
     }
 }

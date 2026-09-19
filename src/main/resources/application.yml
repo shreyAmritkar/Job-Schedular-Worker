@@ -39,6 +39,12 @@ scheduler:
   worker-pool:
     size: 4
     poll-backoff: 500ms
+  execution:
+    visibility-timeout: 30s
+    recovery-interval: 10s
+    idempotency-key-ttl: 24h
+    initial-backoff-millis: 1000
+    max-backoff: 5m
 
 logging:
   level:

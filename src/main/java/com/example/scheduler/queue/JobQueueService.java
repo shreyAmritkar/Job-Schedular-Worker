@@ -1,7 +1,7 @@
 package com.example.scheduler.queue;
 
 import com.example.scheduler.queue.exception.QueueBackpressureException;
-import io.lettuce.core.ScoredValue;
+import io.lettuce.core.Range;
 import io.lettuce.core.ScriptOutputType;
 import io.lettuce.core.api.sync.RedisCommands;
 import io.micrometer.core.instrument.Gauge;
@@ -13,23 +13,25 @@ import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
- * Wraps the Redis sorted-set priority queue: jobs:queue for ordering, a
- * companion hash jobs:queue:enqueued-at for true original wait-time
- * (needed by aging — see the design writeup for why the score alone can't
- * be decoded back into priority+timestamp once aging has touched it).
+ * Wraps every Redis structure involved in job delivery:
+ *  - jobs:queue          sorted set, priority-ordered, waiting to be claimed
+ *  - jobs:queue:enqueued-at  companion hash, true enqueue time (Stage 3, for aging)
+ *  - jobs:processing     sorted set, score = claim deadline (visibility timeout)
+ *  - jobs:delayed        sorted set, score = readyAt (Stage 4: backoff holding area)
+ *  - jobs:dead_letter    list, jobs that exhausted their retry budget
  *
- * Score = priority * PRIORITY_WEIGHT + enqueuedAtMillis, where priority 1
- * is most urgent and 10 is least (see design writeup — this direction, and
- * the '+' rather than '-' on the timestamp, is a correction to the spec's
- * literal formula, which produced LIFO instead of the required FIFO).
+ * Score = priority * PRIORITY_WEIGHT + enqueuedAtMillis, priority 1 most
+ * urgent, 10 least (see Stage 3 design writeup for why).
  */
 @Service
 public class JobQueueService {
@@ -38,11 +40,27 @@ public class JobQueueService {
 
     static final String QUEUE_KEY = "jobs:queue";
     static final String ENQUEUED_AT_KEY = "jobs:queue:enqueued-at";
+    static final String PROCESSING_KEY = "jobs:processing";
+    static final String DELAYED_KEY = "jobs:delayed";
+    static final String DEAD_LETTER_KEY = "jobs:dead_letter";
     static final long PRIORITY_WEIGHT = 1_000_000_000L;
 
-    // Boost stale jobs' scores only if they still exist in the queue (XX) —
-    // never re-insert a job a worker already popped (see race #2 in the
-    // design writeup). CH so we can count how many were actually touched.
+    // Claim: atomically pop the highest-priority waiting job and move it
+    // into the processing set with a visibility deadline. Doing this as one
+    // script closes the exact gap Stage 4 exists to prevent — a crash
+    // between "popped from queue" and "recorded as processing" would lose
+    // the job just as badly as never having a processing set at all.
+    private static final String CLAIM_SCRIPT =
+            "local popped = redis.call('ZPOPMIN', KEYS[1], 1) "
+                    + "if #popped == 0 then return {} end "
+                    + "local member = popped[1] "
+                    + "local originalScore = popped[2] "
+                    + "redis.call('HDEL', KEYS[2], member) "
+                    + "redis.call('ZADD', KEYS[3], ARGV[1], member) "
+                    + "return {member, originalScore}";
+
+    // Aging (Stage 3): boost stale jobs' scores only if they still exist in
+    // the queue (XX) — never re-insert a job a worker already claimed.
     private static final String AGING_SCRIPT =
             "local staleCount = 0 "
                     + "local entries = redis.call('HGETALL', KEYS[2]) "
@@ -61,6 +79,17 @@ public class JobQueueService {
                     + "  end "
                     + "end "
                     + "return staleCount";
+
+    // Promote a job whose backoff has elapsed from jobs:delayed back into
+    // jobs:queue, re-establishing its enqueued-at metadata for Stage 3's
+    // FIFO/aging to keep working correctly on this fresh attempt.
+    private static final String PROMOTE_DELAYED_SCRIPT =
+            "local removed = redis.call('ZREM', KEYS[1], ARGV[1]) "
+                    + "if removed == 1 then "
+                    + "  redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1]) "
+                    + "  redis.call('HSET', KEYS[3], ARGV[1], ARGV[3]) "
+                    + "end "
+                    + "return removed";
 
     private final RedisCommands<String, String> redis;
     private final JobQueueProperties properties;
@@ -94,19 +123,16 @@ public class JobQueueService {
         }
     }
 
-    // @PreDestroy is used when a bean owns resources that need explicit cleanup, like executor threads, sockets, or connections.
-    // Normal beans are just objects and need no manual shutdown; Spring/frameworks handle cleanup automatically where necessary
     @PreDestroy
     public void shutdown() {
         agingExecutor.shutdownNow();
     }
 
     /**
-     * Backpressure is a soft limit: ZCARD then ZADD are two round trips, so
-     * concurrent producers can momentarily push depth slightly past the
-     * threshold before a rejection lands. Making this fully atomic would
-     * need a Lua script combining the check and the write; not done here —
-     * flagged as a deliberate, documented trade-off, not an oversight.
+     * Backpressure is a soft limit: ZCARD then the claim script are
+     * separate round trips, so concurrent producers can momentarily push
+     * depth slightly past the threshold before a rejection lands. A
+     * documented trade-off, not an oversight — see Stage 3 design writeup.
      */
     public void enqueue(UUID jobId, int priority) {
         long currentDepth = depth();
@@ -129,25 +155,90 @@ public class JobQueueService {
     }
 
     /**
-     * ZPOPMIN is atomic: exactly one caller ever receives a given job, no
-     * matter how many workers call this concurrently. Cleanup of the
-     * companion hash entry is best-effort (a second command, not part of
-     * the same atomic step) — see race #3 in the design writeup for why
-     * that's safe: the aging script self-heals any orphan it finds.
+     * Atomically claims the highest-priority waiting job: removes it from
+     * jobs:queue and adds it to jobs:processing with a deadline of
+     * now + visibilityTimeout. Nothing about ownership is proven beyond
+     * "some worker claims this" — see the Stage 4 design writeup for the
+     * race that follows from that.
      */
-    public Optional<QueuedJob> poll() {
-        List<ScoredValue<String>> popped = redis.zpopmin(QUEUE_KEY, 1);
-        if (popped.isEmpty()) {
+    public Optional<QueuedJob> claim(Duration visibilityTimeout) {
+        long deadline = System.currentTimeMillis() + visibilityTimeout.toMillis();
+        List<Object> result = redis.eval(CLAIM_SCRIPT, ScriptOutputType.MULTI,
+                new String[]{QUEUE_KEY, ENQUEUED_AT_KEY, PROCESSING_KEY},
+                String.valueOf(deadline));
+
+        if (result.isEmpty()) {
             return Optional.empty();
         }
-        ScoredValue<String> entry = popped.get(0);
-        redis.hdel(ENQUEUED_AT_KEY, entry.getValue());
-        return Optional.of(new QueuedJob(UUID.fromString(entry.getValue()), entry.getScore()));
+        String jobId = (String) result.get(0);
+        long originalScore = (Long) result.get(1);
+        return Optional.of(new QueuedJob(UUID.fromString(jobId), originalScore));
+    }
+
+    /** Successful completion: the job is done, drop its processing claim. */
+    public void completeJob(UUID jobId) {
+        removeFromProcessing(jobId);
+    }
+
+    public void removeFromProcessing(UUID jobId) {
+        redis.zrem(PROCESSING_KEY, jobId.toString());
     }
 
     public long depth() {
         Long cardinality = redis.zcard(QUEUE_KEY);
         return cardinality == null ? 0 : cardinality;
+    }
+
+    public long processingDepth() {
+        Long cardinality = redis.zcard(PROCESSING_KEY);
+        return cardinality == null ? 0 : cardinality;
+    }
+
+    /** ZRANGEBYSCORE jobs:processing 0 {now} — the visibility-timeout expiry check. */
+    public List<UUID> findExpiredProcessingJobs(long nowMillis) {
+        return redis.zrangebyscore(PROCESSING_KEY, Range.create(0L, nowMillis)).stream()
+                .map(UUID::fromString)
+                .collect(Collectors.toList());
+    }
+
+    /** Stage 4: park a job in jobs:delayed until its backoff elapses. */
+    public void scheduleDelayedRequeue(UUID jobId, long readyAtMillis) {
+        redis.zadd(DELAYED_KEY, readyAtMillis, jobId.toString());
+    }
+
+    public List<UUID> findReadyDelayedJobs(long nowMillis) {
+        return redis.zrangebyscore(DELAYED_KEY, Range.create(0L, nowMillis)).stream()
+                .map(UUID::fromString)
+                .collect(Collectors.toList());
+    }
+
+    public void removeFromDelayed(UUID jobId) {
+        redis.zrem(DELAYED_KEY, jobId.toString());
+    }
+
+    /** Atomically moves a ready job from jobs:delayed into jobs:queue at a fresh priority score. */
+    public void promoteDelayedToQueue(UUID jobId, int priority) {
+        long enqueuedAt = System.currentTimeMillis();
+        double score = computeScore(priority, enqueuedAt);
+        redis.eval(PROMOTE_DELAYED_SCRIPT, ScriptOutputType.INTEGER,
+                new String[]{DELAYED_KEY, QUEUE_KEY, ENQUEUED_AT_KEY},
+                jobId.toString(), String.valueOf(score), String.valueOf(enqueuedAt));
+    }
+
+    public void pushToDeadLetter(UUID jobId) {
+        redis.rpush(DEAD_LETTER_KEY, jobId.toString());
+    }
+
+    public List<UUID> listDeadLetter() {
+        return redis.lrange(DEAD_LETTER_KEY, 0, -1).stream()
+                .map(UUID::fromString)
+                .collect(Collectors.toList());
+    }
+
+    /** count=0 removes every occurrence of this value — safe even if it somehow appears more than once. */
+    public boolean removeDeadLetterEntry(UUID jobId) {
+        Long removed = redis.lrem(DEAD_LETTER_KEY, 0, jobId.toString());
+        return removed != null && removed > 0;
     }
 
     /**

@@ -8,5 +8,6 @@ public enum JobStatus {
     ACTIVE,
     PAUSED,
     DISABLED,
-    CANCELLED
+    CANCELLED,
+    FAILED
 }

@@ -24,7 +24,7 @@ class JobControllerIT extends AbstractIntegrationTest {
     @Test
     void createJob_returns201WithLocationAndBody() {
         CreateJobRequest request = new CreateJobRequest(
-                "nightly-backup", "0 0 3 * * *", null, null, 8, 3);
+                "nightly-backup", "0 0 3 * * *", null, null, 8, 3 , null);
 
         ResponseEntity<JobResponse> response = restTemplate.postForEntity("/api/jobs", request, JobResponse.class);
 
@@ -39,7 +39,7 @@ class JobControllerIT extends AbstractIntegrationTest {
     @Test
     void createJob_rejectsBothCronAndRunAtWith400() {
         CreateJobRequest request = new CreateJobRequest(
-                "bad-job", "0 0 3 * * *", OffsetDateTime.now().plusHours(1), null, 5, 0);
+                "bad-job", "0 0 3 * * *", OffsetDateTime.now().plusHours(1), null, 5, 0 , null);
 
         ResponseEntity<ApiError> response = restTemplate.postForEntity("/api/jobs", request, ApiError.class);
 
@@ -48,7 +48,7 @@ class JobControllerIT extends AbstractIntegrationTest {
 
     @Test
     void createJob_rejectsPriorityOutOfRangeWith400() {
-        CreateJobRequest request = new CreateJobRequest("bad-job", "0 0 3 * * *", null, null, 99, 0);
+        CreateJobRequest request = new CreateJobRequest("bad-job", "0 0 3 * * *", null, null, 99, 0 , null);
 
         ResponseEntity<ApiError> response = restTemplate.postForEntity("/api/jobs", request, ApiError.class);
 
@@ -68,7 +68,7 @@ class JobControllerIT extends AbstractIntegrationTest {
     @Test
     void fullLifecycle_createGetCancelTrigger() {
         CreateJobRequest createRequest = new CreateJobRequest(
-                "lifecycle-job", "0 0 4 * * *", null, null, 5, 1);
+                "lifecycle-job", "0 0 4 * * *", null, null, 5, 1 , null);
         JobResponse created = restTemplate.postForEntity("/api/jobs", createRequest, JobResponse.class).getBody();
         assertThat(created).isNotNull();
 
@@ -106,7 +106,7 @@ class JobControllerIT extends AbstractIntegrationTest {
     void listJobs_returnsPaginatedResults() {
         for (int i = 0; i < 3; i++) {
             restTemplate.postForEntity("/api/jobs",
-                    new CreateJobRequest("job-" + i, "0 0 * * * *", null, null, 5, 0),
+                    new CreateJobRequest("job-" + i, "0 0 * * * *", null, null, 5, 0 , null),
                     JobResponse.class);
         }
 

@@ -19,6 +19,7 @@ public record JobResponse(
         int retryCount,
         JobStatus status,
         OffsetDateTime nextRunAt,
+        UUID idempotencyKey,
         OffsetDateTime createdAt,
         OffsetDateTime updatedAt
 ) {

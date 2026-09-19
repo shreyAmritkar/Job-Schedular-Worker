@@ -58,6 +58,9 @@ public class Job {
     @Column(name = "next_run_at")
     private OffsetDateTime nextRunAt;
 
+    @Column(name = "idempotency_key", nullable = false, updatable = false)
+    private UUID idempotencyKey;
+
     @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -77,7 +80,8 @@ public class Job {
      * doesn't re-validate, it just assembles what's already been checked.
      */
     public static Job create(String name, ScheduleType scheduleType, String cronExpression,
-                              OffsetDateTime runAt, JsonNode payload, int priority, int maxRetries) {
+                              OffsetDateTime runAt, JsonNode payload, int priority, int maxRetries,
+                              UUID idempotencyKey) {
         Job job = new Job();
         job.name = name;
         job.scheduleType = scheduleType;
@@ -88,6 +92,7 @@ public class Job {
         job.maxRetries = maxRetries;
         job.retryCount = 0;
         job.status = JobStatus.ACTIVE;
+        job.idempotencyKey = idempotencyKey != null ? idempotencyKey : UUID.randomUUID();
         // For CRON jobs, the next fire time is computed by the Stage 2+
         // scheduler, which doesn't exist yet — left null deliberately.
         // For ONE_TIME jobs, we already know exactly when it should run.
@@ -137,6 +142,10 @@ public class Job {
 
     public OffsetDateTime getNextRunAt() {
         return nextRunAt;
+    }
+
+    public UUID getIdempotencyKey() {
+        return idempotencyKey;
     }
 
     public OffsetDateTime getCreatedAt() {

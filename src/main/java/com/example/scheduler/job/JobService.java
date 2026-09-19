@@ -42,7 +42,8 @@ public class JobService {
                 request.runAt(),
                 request.payload(),
                 request.priority(),
-                request.maxRetries()
+                request.maxRetries(),
+                request.idempotencyKey()
         );
 
         Job saved = jobRepository.save(job);

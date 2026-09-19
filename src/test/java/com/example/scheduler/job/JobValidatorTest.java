@@ -16,7 +16,7 @@ class JobValidatorTest {
     @Test
     void rejectsWhenBothCronAndRunAtSupplied() {
         CreateJobRequest request = new CreateJobRequest(
-                "job", "0 0 * * * *", OffsetDateTime.now().plusHours(1), null, 5, 0);
+                "job", "0 0 * * * *", OffsetDateTime.now().plusHours(1), null, 5, 0, null);
 
         assertThatThrownBy(() -> validator.validateAndResolveScheduleType(request))
                 .isInstanceOf(InvalidJobScheduleException.class)
@@ -25,7 +25,7 @@ class JobValidatorTest {
 
     @Test
     void rejectsWhenNeitherCronNorRunAtSupplied() {
-        CreateJobRequest request = new CreateJobRequest("job", null, null, null, 5, 0);
+        CreateJobRequest request = new CreateJobRequest("job", null, null, null, 5, 0, null);
 
         assertThatThrownBy(() -> validator.validateAndResolveScheduleType(request))
                 .isInstanceOf(InvalidJobScheduleException.class)
@@ -34,7 +34,7 @@ class JobValidatorTest {
 
     @Test
     void rejectsBlankCronAsEquivalentToMissing() {
-        CreateJobRequest request = new CreateJobRequest("job", "   ", null, null, 5, 0);
+        CreateJobRequest request = new CreateJobRequest("job", "   ", null, null, 5, 0, null);
 
         assertThatThrownBy(() -> validator.validateAndResolveScheduleType(request))
                 .isInstanceOf(InvalidJobScheduleException.class)
@@ -43,7 +43,7 @@ class JobValidatorTest {
 
     @Test
     void rejectsInvalidCronSyntax() {
-        CreateJobRequest request = new CreateJobRequest("job", "not a cron", null, null, 5, 0);
+        CreateJobRequest request = new CreateJobRequest("job", "not a cron", null, null, 5, 0, null);
 
         assertThatThrownBy(() -> validator.validateAndResolveScheduleType(request))
                 .isInstanceOf(InvalidJobScheduleException.class)
@@ -52,7 +52,7 @@ class JobValidatorTest {
 
     @Test
     void acceptsValidCronExpression() {
-        CreateJobRequest request = new CreateJobRequest("job", "0 0 * * * *", null, null, 5, 0);
+        CreateJobRequest request = new CreateJobRequest("job", "0 0 * * * *", null, null, 5, 0, null);
 
         ScheduleType type = validator.validateAndResolveScheduleType(request);
 
@@ -62,7 +62,7 @@ class JobValidatorTest {
     @Test
     void rejectsRunAtInThePast() {
         CreateJobRequest request = new CreateJobRequest(
-                "job", null, OffsetDateTime.now().minusMinutes(5), null, 5, 0);
+                "job", null, OffsetDateTime.now().minusMinutes(5), null, 5, 0, null);
 
         assertThatThrownBy(() -> validator.validateAndResolveScheduleType(request))
                 .isInstanceOf(InvalidJobScheduleException.class)
@@ -72,7 +72,7 @@ class JobValidatorTest {
     @Test
     void acceptsRunAtInTheFuture() {
         CreateJobRequest request = new CreateJobRequest(
-                "job", null, OffsetDateTime.now().plusMinutes(5), null, 5, 0);
+                "job", null, OffsetDateTime.now().plusMinutes(5), null, 5, 0, null);
 
         ScheduleType type = validator.validateAndResolveScheduleType(request);
 

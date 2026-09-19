@@ -32,7 +32,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
     @Transactional
     void savesAndReloadsAJobIncludingJsonbPayload() throws Exception {
         JsonNode payload = objectMapper.readTree("{\"url\": \"https://example.com\", \"retries\": 3}");
-        Job job = Job.create("report-job", ScheduleType.CRON, "0 0 2 * * *", null, payload, 7, 2);
+        Job job = Job.create("report-job", ScheduleType.CRON, "0 0 2 * * *", null, payload, 7, 2, null);
 
         Job saved = jobRepository.saveAndFlush(job);
         entityManager.clear(); // force the next findById to hit Postgres, not the 1st-level cache
@@ -50,7 +50,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
     @Test
     @Transactional
     void cancelIfNotAlreadyCancelled_isIdempotent() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         Job saved = jobRepository.saveAndFlush(job);
 
         int firstCall = jobRepository.cancelIfNotAlreadyCancelled(saved.getId());
@@ -65,7 +65,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
     @Test
     @Transactional
     void triggerIfActive_onlyUpdatesActiveJobs() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         Job saved = jobRepository.saveAndFlush(job);
         jobRepository.cancelIfNotAlreadyCancelled(saved.getId());
 
@@ -78,7 +78,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
     @Test
     @Transactional
     void triggerIfActive_setsNextRunAtOnActiveJob() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         Job saved = jobRepository.saveAndFlush(job);
         OffsetDateTime triggerTime = OffsetDateTime.now();
 
@@ -93,7 +93,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
     void findAll_returnsPagedResultsOrderedByCreatedAtDescending() {
         for (int i = 0; i < 3; i++) {
             jobRepository.saveAndFlush(
-                    Job.create("job-" + i, ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0));
+                    Job.create("job-" + i, ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null));
         }
 
         var page = jobRepository.findAll(
@@ -117,7 +117,7 @@ class JobRepositoryIT extends AbstractIntegrationTest {
 
     private Job invalidJobWithBothScheduleFieldsSet() {
         Job job = Job.create("bad-job", ScheduleType.CRON, "0 0 * * * *",
-                OffsetDateTime.now().plusHours(1), null, 5, 0);
+                OffsetDateTime.now().plusHours(1), null, 5, 0, null);
         // Job.create only sets nextRunAt from runAt for ONE_TIME jobs, but the
         // entity still has scheduleType=CRON with cronExpression AND runAt both
         // populated here (constructed directly, bypassing JobValidator) —

@@ -20,6 +20,7 @@ public final class JobMapper {
                 job.getRetryCount(),
                 job.getStatus(),
                 job.getNextRunAt(),
+                job.getIdempotencyKey(),
                 job.getCreatedAt(),
                 job.getUpdatedAt()
         );

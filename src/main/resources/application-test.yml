@@ -24,6 +24,15 @@ scheduler:
   worker-pool:
     size: 4
     poll-backoff: 100ms
+  execution:
+    visibility-timeout: 2s
+    # Intentionally NOT fast: tests call jobRecoveryService.runRecoveryPass()
+    # directly for determinism, rather than racing a background timer. A
+    # long interval here just keeps the real scheduled loop out of the way.
+    recovery-interval: 1h
+    idempotency-key-ttl: 1h
+    initial-backoff-millis: 100
+    max-backoff: 2s
 
 server:
   port: 0

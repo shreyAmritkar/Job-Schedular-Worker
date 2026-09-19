@@ -1,5 +1,7 @@
 package com.example.scheduler.queue;
 
+import com.example.scheduler.execution.ClaimedJobHandler;
+import com.example.scheduler.execution.ExecutionProperties;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
@@ -26,11 +28,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * These tests exercise the claim -> handle -> complete loop with a
+ * lightweight, Postgres-free ClaimedJobHandler test double — the full
+ * production JobExecutionCoordinator (idempotency, job_executions
+ * recording, retry-on-failure) is exercised separately in the `execution`
+ * package's Spring-context tests. That split keeps these fast, deterministic
+ * concurrency scenarios independent of Postgres entirely.
+ */
 @Testcontainers
 class WorkerPoolConcurrencyIT {
 
     private static final GenericContainer<?> REDIS =
             new GenericContainer<>(DockerImageName.parse("redis:7")).withExposedPorts(6379);
+    private static final ExecutionProperties EXECUTION_PROPERTIES = new ExecutionProperties(); // 30s default visibility timeout, generous for these tests
 
     private static RedisClient redisClient;
     private static StatefulRedisConnection<String, String> connection;
@@ -62,7 +73,7 @@ class WorkerPoolConcurrencyIT {
 
     @AfterEach
     void cleanUp() {
-        commands.del(JobQueueService.QUEUE_KEY, JobQueueService.ENQUEUED_AT_KEY);
+        commands.del(JobQueueService.QUEUE_KEY, JobQueueService.ENQUEUED_AT_KEY, JobQueueService.PROCESSING_KEY);
         queueService.shutdown();
     }
 
@@ -81,19 +92,19 @@ class WorkerPoolConcurrencyIT {
             queueService.enqueue(id, 1); // then high-priority
         }
 
-        RecordingJobExecutor executor = new RecordingJobExecutor(0);
+        RecordingClaimedJobHandler handler = new RecordingClaimedJobHandler(queueService, 0);
         WorkerPoolProperties workerProps = new WorkerPoolProperties();
         workerProps.setSize(1); // single worker gives a strictly deterministic global order
-        WorkerPool pool = new WorkerPool(queueService, executor, workerProps, new SimpleMeterRegistry());
+        WorkerPool pool = new WorkerPool(queueService, handler, workerProps, EXECUTION_PROPERTIES, new SimpleMeterRegistry());
         pool.start();
 
         try {
-            awaitExecutionCount(executor, 100, Duration.ofSeconds(15));
+            awaitExecutionCount(handler, 100, Duration.ofSeconds(15));
         } finally {
             pool.shutdown();
         }
 
-        List<UUID> order = executor.executionOrder();
+        List<UUID> order = handler.executionOrder();
         int lastHighPriorityIndex = lastIndexOfAny(order, highPriorityIds);
         int firstLowPriorityIndex = firstIndexOfAny(order, lowPriorityIds);
 
@@ -112,21 +123,21 @@ class WorkerPoolConcurrencyIT {
         // 100ms of simulated work per job widens the window in which
         // multiple workers are genuinely active at once, so the assertion
         // below isn't relying on a lucky sampling instant.
-        RecordingJobExecutor executor = new RecordingJobExecutor(100);
+        RecordingClaimedJobHandler handler = new RecordingClaimedJobHandler(queueService, 100);
         WorkerPoolProperties workerProps = new WorkerPoolProperties();
         workerProps.setSize(4);
-        WorkerPool pool = new WorkerPool(queueService, executor, workerProps, new SimpleMeterRegistry());
+        WorkerPool pool = new WorkerPool(queueService, handler, workerProps, EXECUTION_PROPERTIES, new SimpleMeterRegistry());
         pool.start();
 
         int maxObservedActive = 0;
         long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline && executor.executionOrder().size() < 50) {
+        while (System.currentTimeMillis() < deadline && handler.executionOrder().size() < 50) {
             maxObservedActive = Math.max(maxObservedActive, pool.activeWorkerCount());
             Thread.sleep(5);
         }
         pool.shutdown();
 
-        assertThat(executor.executionOrder()).hasSize(50);
+        assertThat(handler.executionOrder()).hasSize(50);
         assertThat(maxObservedActive)
                 .as("at least two workers should have been observed executing simultaneously")
                 .isGreaterThan(1);
@@ -157,11 +168,11 @@ class WorkerPoolConcurrencyIT {
 
         // 20ms of simulated work per job keeps a genuine backlog alive
         // instead of the flood draining faster than it can build up.
-        RecordingJobExecutor executor = new RecordingJobExecutor(20);
+        RecordingClaimedJobHandler handler = new RecordingClaimedJobHandler(queueService, 20);
         WorkerPoolProperties workerProps = new WorkerPoolProperties();
         workerProps.setSize(4);
         workerProps.setPollBackoff(Duration.ofMillis(50));
-        WorkerPool pool = new WorkerPool(queueService, executor, workerProps, new SimpleMeterRegistry());
+        WorkerPool pool = new WorkerPool(queueService, handler, workerProps, EXECUTION_PROPERTIES, new SimpleMeterRegistry());
         pool.start();
 
         ScheduledExecutorService agingDriver = Executors.newSingleThreadScheduledExecutor();
@@ -171,7 +182,7 @@ class WorkerPoolConcurrencyIT {
             long deadline = System.currentTimeMillis() + Duration.ofSeconds(20).toMillis();
             boolean executed = false;
             while (System.currentTimeMillis() < deadline) {
-                if (executor.executionOrder().contains(lowPriorityJobId)) {
+                if (handler.executionOrder().contains(lowPriorityJobId)) {
                     executed = true;
                     break;
                 }
@@ -195,17 +206,17 @@ class WorkerPoolConcurrencyIT {
         }
     }
 
-    private void awaitExecutionCount(RecordingJobExecutor executor, int expectedCount, Duration timeout)
+    private void awaitExecutionCount(RecordingClaimedJobHandler handler, int expectedCount, Duration timeout)
             throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         while (System.currentTimeMillis() < deadline) {
-            if (executor.executionOrder().size() >= expectedCount) {
+            if (handler.executionOrder().size() >= expectedCount) {
                 return;
             }
             Thread.sleep(20);
         }
         throw new AssertionError("Expected " + expectedCount + " executions but observed "
-                + executor.executionOrder().size() + " within " + timeout);
+                + handler.executionOrder().size() + " within " + timeout);
     }
 
     private int lastIndexOfAny(List<UUID> order, List<UUID> ids) {
@@ -229,21 +240,23 @@ class WorkerPoolConcurrencyIT {
 
     /**
      * Test double recording execution order and optionally simulating work
-     * via a sleep, so concurrency scenarios can be widened enough to
-     * reliably observe (multiple active workers) or genuinely contested
-     * (a continuous flood competing against a starved job).
+     * via a sleep. Also calls completeJob() itself (standing in for what
+     * JobExecutionCoordinator does in production) so jobs:processing
+     * doesn't accumulate stale claims across these tests.
      */
-    private static final class RecordingJobExecutor implements JobExecutor {
+    private static final class RecordingClaimedJobHandler implements ClaimedJobHandler {
 
+        private final JobQueueService queueService;
         private final List<UUID> executionOrder = Collections.synchronizedList(new ArrayList<>());
         private final long simulatedWorkMillis;
 
-        RecordingJobExecutor(long simulatedWorkMillis) {
+        RecordingClaimedJobHandler(JobQueueService queueService, long simulatedWorkMillis) {
+            this.queueService = queueService;
             this.simulatedWorkMillis = simulatedWorkMillis;
         }
 
         @Override
-        public void execute(QueuedJob job) {
+        public void handle(QueuedJob job) {
             if (simulatedWorkMillis > 0) {
                 try {
                     Thread.sleep(simulatedWorkMillis);
@@ -252,6 +265,7 @@ class WorkerPoolConcurrencyIT {
                 }
             }
             executionOrder.add(job.jobId());
+            queueService.completeJob(job.jobId());
         }
 
         List<UUID> executionOrder() {

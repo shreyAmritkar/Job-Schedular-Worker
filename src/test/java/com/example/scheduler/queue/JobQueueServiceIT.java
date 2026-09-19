@@ -16,22 +16,26 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Tests queue mechanics (ordering, FIFO tie-breaking, backpressure, aging)
- * directly against real Redis. Deliberately no WorkerPool here — that would
- * introduce a consumer racing to drain what this test is trying to inspect.
- * See WorkerPoolConcurrencyIT for the producer+consumer scenarios.
+ * Tests queue mechanics (ordering, FIFO tie-breaking, backpressure, aging,
+ * processing/delayed/dead-letter primitives) directly against real Redis.
+ * Deliberately no WorkerPool here — that would introduce a consumer racing
+ * to drain what this test is trying to inspect. See
+ * WorkerPoolConcurrencyIT for producer+consumer scenarios and the
+ * `execution` package's tests for retry/recovery/dead-letter orchestration.
  */
 @Testcontainers
 class JobQueueServiceIT {
 
     private static final GenericContainer<?> REDIS =
             new GenericContainer<>(DockerImageName.parse("redis:7")).withExposedPorts(6379);
+    private static final Duration VISIBILITY_TIMEOUT = Duration.ofSeconds(30);
 
     private static RedisClient redisClient;
     private static StatefulRedisConnection<String, String> connection;
@@ -63,24 +67,51 @@ class JobQueueServiceIT {
 
     @AfterEach
     void cleanUp() {
-        commands.del(JobQueueService.QUEUE_KEY, JobQueueService.ENQUEUED_AT_KEY);
+        commands.del(JobQueueService.QUEUE_KEY, JobQueueService.ENQUEUED_AT_KEY,
+                JobQueueService.PROCESSING_KEY, JobQueueService.DELAYED_KEY, JobQueueService.DEAD_LETTER_KEY);
         queueService.shutdown();
     }
 
     @Test
-    void enqueueAndPoll_roundTripsASingleJob() {
+    void enqueueAndClaim_roundTripsASingleJob() {
         UUID jobId = UUID.randomUUID();
 
         queueService.enqueue(jobId, 5);
-        var polled = queueService.poll();
+        var claimed = queueService.claim(VISIBILITY_TIMEOUT);
 
-        assertThat(polled).isPresent();
-        assertThat(polled.get().jobId()).isEqualTo(jobId);
+        assertThat(claimed).isPresent();
+        assertThat(claimed.get().jobId()).isEqualTo(jobId);
     }
 
     @Test
-    void poll_returnsEmptyWhenQueueIsEmpty() {
-        assertThat(queueService.poll()).isEmpty();
+    void claim_returnsEmptyWhenQueueIsEmpty() {
+        assertThat(queueService.claim(VISIBILITY_TIMEOUT)).isEmpty();
+    }
+
+    @Test
+    void claim_movesTheJobIntoTheProcessingSetAtomically() {
+        UUID jobId = UUID.randomUUID();
+        queueService.enqueue(jobId, 5);
+
+        queueService.claim(VISIBILITY_TIMEOUT);
+
+        assertThat(queueService.depth()).isEqualTo(0);
+        assertThat(queueService.processingDepth()).isEqualTo(1);
+        Double deadline = commands.zscore(JobQueueService.PROCESSING_KEY, jobId.toString());
+        assertThat(deadline).isNotNull();
+        assertThat(deadline).isGreaterThan((double) System.currentTimeMillis()); // deadline is in the future
+    }
+
+    @Test
+    void completeJob_removesFromProcessing() {
+        UUID jobId = UUID.randomUUID();
+        queueService.enqueue(jobId, 5);
+        queueService.claim(VISIBILITY_TIMEOUT);
+        assertThat(queueService.processingDepth()).isEqualTo(1);
+
+        queueService.completeJob(jobId);
+
+        assertThat(queueService.processingDepth()).isEqualTo(0);
     }
 
     @Test
@@ -91,8 +122,8 @@ class JobQueueServiceIT {
         queueService.enqueue(lowPriorityId, 10); // least urgent, enqueued first
         queueService.enqueue(highPriorityId, 1); // most urgent, enqueued second
 
-        assertThat(queueService.poll()).map(QueuedJob::jobId).contains(highPriorityId);
-        assertThat(queueService.poll()).map(QueuedJob::jobId).contains(lowPriorityId);
+        assertThat(queueService.claim(VISIBILITY_TIMEOUT)).map(QueuedJob::jobId).contains(highPriorityId);
+        assertThat(queueService.claim(VISIBILITY_TIMEOUT)).map(QueuedJob::jobId).contains(lowPriorityId);
     }
 
     @Test
@@ -104,8 +135,8 @@ class JobQueueServiceIT {
         Thread.sleep(5); // guarantee a distinct, later millisecond timestamp
         queueService.enqueue(secondId, 5);
 
-        assertThat(queueService.poll()).map(QueuedJob::jobId).contains(firstId);
-        assertThat(queueService.poll()).map(QueuedJob::jobId).contains(secondId);
+        assertThat(queueService.claim(VISIBILITY_TIMEOUT)).map(QueuedJob::jobId).contains(firstId);
+        assertThat(queueService.claim(VISIBILITY_TIMEOUT)).map(QueuedJob::jobId).contains(secondId);
     }
 
     @Test
@@ -117,7 +148,7 @@ class JobQueueServiceIT {
 
         assertThat(queueService.depth()).isEqualTo(2);
 
-        queueService.poll();
+        queueService.claim(VISIBILITY_TIMEOUT);
 
         assertThat(queueService.depth()).isEqualTo(1);
     }
@@ -160,13 +191,13 @@ class JobQueueServiceIT {
     }
 
     @Test
-    void applyAging_doesNotResurrectAJobAWorkerAlreadyPopped() throws InterruptedException {
+    void applyAging_doesNotResurrectAJobAWorkerAlreadyClaimed() throws InterruptedException {
         properties.setAgingThreshold(Duration.ofMillis(10));
 
         UUID jobId = UUID.randomUUID();
         queueService.enqueue(jobId, 5);
         Thread.sleep(50);
-        queueService.poll(); // a "worker" consumes it before the aging pass runs
+        queueService.claim(VISIBILITY_TIMEOUT); // a "worker" claims it before the aging pass runs
 
         long boosted = queueService.applyAging();
 
@@ -174,6 +205,49 @@ class JobQueueServiceIT {
         assertThat(queueService.depth()).isEqualTo(0);
         // orphaned metadata is cleaned up as a side effect, not left to leak
         assertThat(commands.hget(JobQueueService.ENQUEUED_AT_KEY, jobId.toString())).isNull();
+    }
+
+    @Test
+    void findExpiredProcessingJobs_findsOnlyJobsPastTheirDeadline() {
+        UUID expiredId = UUID.randomUUID();
+        UUID freshId = UUID.randomUUID();
+        queueService.enqueue(expiredId, 5);
+        queueService.enqueue(freshId, 5);
+
+        queueService.claim(Duration.ofMillis(1)); // expiredId: deadline already in the past by the time we check
+        queueService.claim(Duration.ofMinutes(10)); // freshId: deadline far in the future
+
+        List<UUID> expired = queueService.findExpiredProcessingJobs(System.currentTimeMillis());
+
+        assertThat(expired).contains(expiredId);
+        assertThat(expired).doesNotContain(freshId);
+    }
+
+    @Test
+    void delayedRequeue_promotesReadyJobsBackIntoTheQueue() {
+        UUID jobId = UUID.randomUUID();
+        queueService.scheduleDelayedRequeue(jobId, System.currentTimeMillis() - 1); // already ready
+
+        List<UUID> ready = queueService.findReadyDelayedJobs(System.currentTimeMillis());
+        assertThat(ready).contains(jobId);
+
+        queueService.promoteDelayedToQueue(jobId, 5);
+
+        assertThat(queueService.depth()).isEqualTo(1);
+        assertThat(queueService.findReadyDelayedJobs(System.currentTimeMillis())).doesNotContain(jobId);
+    }
+
+    @Test
+    void deadLetter_pushListAndRemoveRoundTrip() {
+        UUID jobId = UUID.randomUUID();
+
+        queueService.pushToDeadLetter(jobId);
+        assertThat(queueService.listDeadLetter()).containsExactly(jobId);
+
+        boolean removed = queueService.removeDeadLetterEntry(jobId);
+
+        assertThat(removed).isTrue();
+        assertThat(queueService.listDeadLetter()).isEmpty();
     }
 
     @Test

@@ -59,7 +59,7 @@ class JobServiceTest {
     @Test
     void createJob_persistsValidatedJob() {
         CreateJobRequest request = new CreateJobRequest(
-                "nightly-report", "0 0 2 * * *", null, null, 5, 3);
+                "nightly-report", "0 0 2 * * *", null, null, 5, 3 , null);
         when(jobValidator.validateAndResolveScheduleType(request)).thenReturn(ScheduleType.CRON);
         when(jobRepository.save(any(Job.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -76,7 +76,7 @@ class JobServiceTest {
 
     @Test
     void createJob_doesNotPersistWhenValidationFails() {
-        CreateJobRequest request = new CreateJobRequest("bad-job", null, null, null, 5, 0);
+        CreateJobRequest request = new CreateJobRequest("bad-job", null, null, null, 5, 0, null);
         when(jobValidator.validateAndResolveScheduleType(request))
                 .thenThrow(new com.example.scheduler.job.exception.InvalidJobScheduleException("bad"));
 
@@ -88,7 +88,7 @@ class JobServiceTest {
 
     @Test
     void getJob_returnsMappedResponseWhenFound() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         when(jobRepository.findById(jobId)).thenReturn(Optional.of(job));
 
         // Job.create doesn't set an id (that's Hibernate's job on persist), so
@@ -128,7 +128,7 @@ class JobServiceTest {
     @Test
     void triggerJob_succeedsAndReturnsUpdatedJobWhenActive() {
         when(jobRepository.triggerIfActive(eq(jobId), any(OffsetDateTime.class))).thenReturn(1);
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         when(jobRepository.findById(jobId)).thenReturn(Optional.of(job));
 
         JobResponse response = jobService.triggerJob(jobId);
@@ -139,7 +139,7 @@ class JobServiceTest {
     @Test
     void triggerJob_throwsConflictWhenJobNotActive() {
         when(jobRepository.triggerIfActive(eq(jobId), any(OffsetDateTime.class))).thenReturn(0);
-        Job cancelledJob = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job cancelledJob = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         when(jobRepository.findById(jobId)).thenReturn(Optional.of(cancelledJob));
 
         assertThatThrownBy(() -> jobService.triggerJob(jobId))
@@ -183,7 +183,7 @@ class JobServiceTest {
 
     @Test
     void enqueueJob_delegatesToQueueServiceWhenJobIsActive() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         when(jobRepository.findById(jobId)).thenReturn(Optional.of(job));
 
         jobService.enqueueJob(jobId);
@@ -221,7 +221,7 @@ class JobServiceTest {
      * adding a test-only setter to production code.
      */
     private Job cancelledJob() {
-        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0);
+        Job job = Job.create("job", ScheduleType.CRON, "0 0 * * * *", null, null, 5, 0, null);
         try {
             var statusField = Job.class.getDeclaredField("status");
             statusField.setAccessible(true);

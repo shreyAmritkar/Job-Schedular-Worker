@@ -1,9 +1,11 @@
 # Distributed Job Scheduler
 
-Stages 0–3 complete: project skeleton, job CRUD, Redis-based leader
-election, and a Redis-backed priority job queue with a worker pool. No
-cron scheduling, visibility timeout, per-job distributed locking, or
-retries yet — that starts in later stages.
+Stages 0–4 complete: project skeleton, job CRUD, Redis-based leader
+election, a Redis-backed priority job queue with a worker pool, and
+visibility-timeout-based crash recovery with retry/backoff, a dead-letter
+queue, and idempotency-key-based duplicate-execution protection. No cron
+scheduling or per-job distributed locking/fencing yet — that starts in
+later stages.
 
 ## Stack
 
@@ -50,14 +52,24 @@ distributed-job-scheduler/
 │   │   ├── SchedulerStatusController.java
 │   │   └── dto/SchedulerStatusResponse.java
 │   ├── queue/                            # Stage 3: Redis priority queue + workers
-│   │   ├── JobQueueService.java          # ZADD/ZPOPMIN, backpressure, Lua aging
+│   │   ├── JobQueueService.java          # ZADD/ZPOPMIN/ZRANGEBYSCORE, backpressure, Lua claim/aging/promote
 │   │   ├── JobQueueProperties.java       # backpressure threshold, aging timing
-│   │   ├── QueuedJob.java                # jobId + score, returned by poll()
-│   │   ├── WorkerPool.java               # configurable worker threads
+│   │   ├── QueuedJob.java                # jobId + score, returned by claim()
+│   │   ├── WorkerPool.java               # configurable worker threads (claim -> ClaimedJobHandler)
 │   │   ├── WorkerPoolProperties.java     # pool size, poll backoff
-│   │   ├── JobExecutor.java              # execution interface
+│   │   ├── JobExecutor.java              # the business-logic-only execution interface
 │   │   ├── LoggingJobExecutor.java       # Stage 3's placeholder implementation
 │   │   └── exception/QueueBackpressureException.java
+│   ├── execution/                        # Stage 4: visibility timeout, retry, dead-letter, idempotency
+│   │   ├── ExecutionProperties.java      # visibility timeout, recovery interval, backoff, idempotency TTL
+│   │   ├── ClaimedJobHandler.java        # the seam WorkerPool calls after claim()
+│   │   ├── JobExecutionCoordinator.java  # idempotency check -> execute -> record -> complete/retry
+│   │   ├── RetryCoordinator.java         # shared retry/backoff/dead-letter decision
+│   │   ├── RetryPolicy.java              # pure exponential-backoff formula
+│   │   ├── IdempotencyGuard.java         # Redis SET NX-based duplicate-effect prevention
+│   │   ├── JobRecoveryService.java       # leader-only, every 10s: reclaim expired claims, sweep backoff
+│   │   ├── DeadLetterService.java        # list / manually requeue dead-lettered jobs
+│   │   └── DeadLetterController.java
 │   └── common/
 │       ├── PageResponse.java             # stable pagination shape
 │       ├── redis/RedisClientConfig.java  # raw Lettuce beans (not RedisTemplate)
@@ -118,6 +130,48 @@ mvn clean verify
 Tests use Testcontainers to spin up disposable Postgres and Redis containers
 per JVM run — no docker-compose stack needs to be running first. Requires a
 working Docker daemon on the machine running the tests.
+
+## API (Stage 4)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/jobs/dead-letter` | List jobs currently in the dead-letter queue. |
+| `POST` | `/api/jobs/dead-letter/{id}/requeue` | Reset a dead-lettered job back to ACTIVE with a fresh retry budget and push it back into `jobs:queue`. `404` unknown job, `409` job isn't currently dead-lettered. |
+
+**Job model change:** every job now has an `idempotencyKey` (UUID), generated
+server-side unless the caller supplies one at creation. Executors use it via
+`IdempotencyGuard` to deduplicate side effects across possibly-duplicate
+deliveries — see the design writeup for exactly why duplicates are possible
+even with visibility timeout in place, and what this does and doesn't
+protect against.
+
+**New job status:** `FAILED` — set when a job exhausts its retry budget and
+is moved to the dead-letter queue. The only way back to `ACTIVE` is the
+manual requeue endpoint above.
+
+Redis structures added:
+- `jobs:processing` — sorted set, score = claim deadline (`now + visibilityTimeout`). A worker's claim on a job, not proof the work is happening.
+- `jobs:delayed` — sorted set, score = `readyAt`. Holding area for a job between "recovery decided to retry it" and "its backoff has elapsed." Not named in the original spec — added because "re-enqueue after backoff" needs somewhere to wait without blocking the recovery loop. Swept back into `jobs:queue` on the same 10s cadence as recovery.
+- `jobs:dead_letter` — list, job IDs that exhausted their retry budget.
+- `jobs:idempotency:{key}` — individual `SET NX EX` keys, one per idempotency key claimed, TTL-bound.
+
+Metrics: `jobs.retried`, `jobs.dead_lettered`, `recovery.runs`, `recovery.recovered`.
+
+Backoff: `min(1000ms * 2^retryCount, 5 minutes)`, using the retry count
+*after* incrementing.
+
+Recovery: leader-only (checked via Stage 2's `LeaderState`), every 10
+seconds — `ZRANGEBYSCORE jobs:processing 0 {now}` for expired claims, then
+a sweep of `jobs:delayed` for anything whose backoff has elapsed.
+
+**A residual risk, stated plainly:** visibility timeout does not, by
+itself, prevent a job from being executed twice when a worker is slow but
+not actually crashed — recovery can't tell the difference between "abandoned"
+and "still running, just slow." This stage mitigates the *consequence*
+(duplicate side effects) via idempotency keys, but does not eliminate the
+*race* itself. Fixing that structurally needs fencing tokens / per-job
+distributed locking, which is still out of scope. Full analysis in the
+Stage 4 design writeup.
 
 ## API (Stage 3)
 
@@ -225,11 +279,10 @@ If it persists:
 ## Explicitly out of scope so far
 
 - Any cron *execution* — cron expressions are validated, never evaluated/run
-- Job execution logic beyond LoggingJobExecutor's placeholder log line
-- Retries, visibility timeout, per-job distributed locking
-- Fencing tokens / leader epoch numbers
+- Real job execution logic beyond LoggingJobExecutor's placeholder log line
+- Per-job distributed locking / fencing tokens — the one gap visibility
+  timeout + idempotency keys don't close; see the Stage 4 design writeup
 - The leader automatically discovering due jobs from Postgres and calling
-  the enqueue endpoint — Stage 3 built the queue/worker infrastructure and
-  one manual enqueue entry point; wiring "leader walks next_run_at and
-  enqueues automatically" is a Stage 4 concern once cron evaluation exists
-- A `JobExecution` entity/repository — `job_executions` is schema-only
+  the enqueue endpoint — still a Stage 5+ concern once cron evaluation exists
+- Dashboards/alerting on the new metrics — they're registered via
+  Micrometer and queryable at `/actuator/metrics/...`, nothing more yet
